@@ -1,367 +1,563 @@
-// @ts-nocheck -- intentionally dependency-free JavaScript in Node's .ts entrypoint.
-// Original offline raster news poster. Node 22 standard library only.
-// All coordinates are in poster pixels; rasterization is supersampled 3x.
-import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+// Draws the 21 November 2026 world news poster as one 1024x1024 PNG.
+// Pure Node: reads two bundled TrueType faces, rasterises their outlines itself, and writes the
+// PNG with zlib. No npm, no canvas, no network, no system fonts.
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deflateSync } from 'node:zlib';
 
-const SIZE = 1024, SS = 3, W = SIZE * SS;
-const BG = [15, 18, 21], WHITE = [240, 238, 231];
-const MUTED = [167, 172, 174], BORDER = [69, 74, 76];
-const ACCENT = [242, 166, 93];
-const pixels = new Uint8Array(W * W * 3);
-for (let i = 0; i < pixels.length; i += 3) pixels.set(BG, i);
+const SS = 2; // supersampling factor: draw at 2x, box-filter down to 1024
+const W = 1024;
+const H = 1024;
+const OUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const HERE = fileURLToPath(new URL('.', import.meta.url));
 
-function span(y, x0, x1, color) {
-  y = Math.floor(y);
-  if (y < 0 || y >= W) return;
-  const left = Math.max(0, Math.ceil(x0 - 0.5));
-  const right = Math.min(W - 1, Math.floor(x1 - 0.5));
-  for (let x = left; x <= right; x++) pixels.set(color, (y * W + x) * 3);
+const INK = [11, 11, 12] as const;
+const PAPER = [244, 243, 240] as const;
+const MUTED = [148, 148, 143] as const;
+const ACCENT = [232, 163, 61] as const;
+const RULE = [58, 58, 56] as const;
+
+type RGB = readonly [number, number, number];
+
+// ---------------------------------------------------------------- font tables
+
+type Face = {
+  upem: number;
+  numGlyphs: number;
+  loca: number[];
+  glyf: number;
+  cmap: Map<number, number>;
+  adv: number[];
+  buf: Buffer;
+};
+
+function u16(b: Buffer, o: number): number {
+  return (b[o] << 8) | b[o + 1];
 }
-function rect(x, y, w, h, color) {
-  for (let sy = Math.round(y * SS); sy < Math.round((y + h) * SS); sy++) {
-    span(sy, x * SS, (x + w) * SS, color);
-  }
+function i16(b: Buffer, o: number): number {
+  const v = (b[o] << 8) | b[o + 1];
+  return v >= 0x8000 ? v - 0x10000 : v;
 }
-function line(x0, y0, x1, y1, color = ACCENT, width = 2) {
-  const ax = x0 * SS, ay = y0 * SS, bx = x1 * SS, by = y1 * SS;
-  const radius = width * SS / 2;
-  const dx = bx - ax, dy = by - ay, d2 = dx * dx + dy * dy;
-  for (let y = Math.max(0, Math.floor(Math.min(ay, by) - radius));
-    y <= Math.min(W - 1, Math.ceil(Math.max(ay, by) + radius)); y++) {
-    for (let x = Math.max(0, Math.floor(Math.min(ax, bx) - radius));
-      x <= Math.min(W - 1, Math.ceil(Math.max(ax, bx) + radius)); x++) {
-      const t = d2 ? Math.max(0, Math.min(1, ((x + .5 - ax) * dx + (y + .5 - ay) * dy) / d2)) : 0;
-      if ((x + .5 - ax - t * dx) ** 2 + (y + .5 - ay - t * dy) ** 2 <= radius ** 2) {
-        pixels.set(color, (y * W + x) * 3);
-      }
-    }
-  }
-}
-function path(points, color = ACCENT, width = 2, closed = false) {
-  for (let i = 1; i < points.length; i++) line(...points[i - 1], ...points[i], color, width);
-  if (closed) line(...points.at(-1), ...points[0], color, width);
-}
-function circle(cx, cy, radius, color = ACCENT, width = 2) {
-  const points = [];
-  for (let i = 0; i <= 64; i++) {
-    const a = i * Math.PI / 32;
-    points.push([cx + Math.cos(a) * radius, cy + Math.sin(a) * radius]);
-  }
-  path(points, color, width);
+function u32(b: Buffer, o: number): number {
+  return ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
 }
 
-// Minimal TrueType reader: cmap 4/12, hmtx, loca and simple/composite glyf.
-// Quadratic contours are flattened and filled with the non-zero winding rule.
-class Face {
-  constructor(name) {
-    const base = fileURLToPath(new URL('.', import.meta.url));
-    try { this.b = readFileSync(join(base, 'assets', name)); }
-    catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-      this.b = readFileSync(join('/usr/share/fonts/truetype/dejavu', name));
-    }
-    this.tables = {};
-    for (let i = 0; i < this.u16(4); i++) {
-      const p = 12 + i * 16;
-      this.tables[this.b.toString('ascii', p, p + 4)] = this.u32(p + 8);
-    }
-    const head = this.tables.head, hhea = this.tables.hhea;
-    this.units = this.u16(head + 18);
-    this.longLoca = this.i16(head + 50) !== 0;
-    this.metrics = this.u16(hhea + 34);
-    this.cache = new Map();
-    const cmap = this.tables.cmap;
-    this.cmap = 0;
-    for (let i = 0; i < this.u16(cmap + 2); i++) {
-      const p = cmap + 4 + i * 8, sub = cmap + this.u32(p + 4);
-      if (this.u16(sub) === 12) { this.cmap = sub; break; }
-      if (this.u16(sub) === 4) this.cmap = sub;
-    }
-    if (!this.cmap) throw new Error('Missing Unicode cmap');
+function loadFace(path: string): Face {
+  const buf = readFileSync(path);
+  const tables = new Map<string, { off: number; len: number }>();
+  const n = u16(buf, 4);
+  for (let i = 0; i < n; i++) {
+    const rec = 12 + i * 16;
+    const tag = buf.toString('ascii', rec, rec + 4);
+    tables.set(tag, { off: u32(buf, rec + 8), len: u32(buf, rec + 12) });
   }
-  u16(p) { return this.b.readUInt16BE(p); }
-  i16(p) { return this.b.readInt16BE(p); }
-  u32(p) { return this.b.readUInt32BE(p); }
-  glyphId(cp) {
-    const p = this.cmap;
-    if (this.u16(p) === 12) {
-      for (let i = 0; i < this.u32(p + 12); i++) {
-        const q = p + 16 + i * 12, start = this.u32(q), end = this.u32(q + 4);
-        if (cp >= start && cp <= end) return this.u32(q + 8) + cp - start;
-      }
-    } else {
-      const n = this.u16(p + 6) / 2;
-      const end = p + 14, start = end + n * 2 + 2;
-      const delta = start + n * 2, ranges = delta + n * 2;
-      for (let i = 0; i < n; i++) {
-        if (cp < this.u16(start + i * 2) || cp > this.u16(end + i * 2)) continue;
-        const d = this.i16(delta + i * 2), r = this.u16(ranges + i * 2);
-        if (!r) return (cp + d) & 65535;
-        const g = this.u16(ranges + i * 2 + r + 2 * (cp - this.u16(start + i * 2)));
-        return g ? (g + d) & 65535 : 0;
-      }
-    }
-    return 0;
+  const head = tables.get('head')!.off;
+  const upem = u16(buf, head + 18);
+  const longLoca = i16(buf, head + 50) === 1;
+  const numGlyphs = u16(buf, tables.get('maxp')!.off + 4);
+
+  const locaOff = tables.get('loca')!.off;
+  const loca: number[] = [];
+  for (let i = 0; i <= numGlyphs; i++) {
+    loca.push(longLoca ? u32(buf, locaOff + i * 4) : u16(buf, locaOff + i * 2) * 2);
   }
-  advance(id) { return this.u16(this.tables.hmtx + Math.min(id, this.metrics - 1) * 4); }
-  location(id) {
-    return this.tables.glyf + (this.longLoca
-      ? this.u32(this.tables.loca + id * 4) : this.u16(this.tables.loca + id * 2) * 2);
+
+  const nMetrics = u16(buf, tables.get('hhea')!.off + 34);
+  const hmtx = tables.get('hmtx')!.off;
+  const adv: number[] = [];
+  let last = 0;
+  for (let i = 0; i < numGlyphs; i++) {
+    if (i < nMetrics) last = u16(buf, hmtx + i * 4);
+    adv.push(last);
   }
-  contours(id, depth = 0) {
-    if (depth > 12) throw new Error('Composite recursion');
-    if (this.cache.has(id)) return this.cache.get(id);
-    let p = this.location(id);
-    if (p === this.location(id + 1)) return [];
-    const n = this.i16(p), contours = [];
-    p += 10;
-    if (n >= 0) {
-      const ends = [];
-      for (let i = 0; i < n; i++, p += 2) ends.push(this.u16(p));
-      const instructions = this.u16(p); p += 2 + instructions;
-      const count = n ? ends.at(-1) + 1 : 0, flags = [];
-      while (flags.length < count) {
-        const f = this.b[p++]; flags.push(f);
-        if (f & 8) { const repeats = this.b[p++]; for (let j = 0; j < repeats; j++) flags.push(f); }
-      }
-      const xs = [], ys = [];
-      let x = 0, y = 0;
-      for (const f of flags) {
-        if (f & 2) x += (f & 16 ? 1 : -1) * this.b[p++];
-        else if (!(f & 16)) { x += this.i16(p); p += 2; }
-        xs.push(x);
-      }
-      for (const f of flags) {
-        if (f & 4) y += (f & 32 ? 1 : -1) * this.b[p++];
-        else if (!(f & 32)) { y += this.i16(p); p += 2; }
-        ys.push(y);
-      }
-      let start = 0;
-      for (const end of ends) {
-        contours.push(xs.slice(start, end + 1).map((x, j) => ({ x, y: ys[start + j], on: !!(flags[start + j] & 1) })));
-        start = end + 1;
-      }
-    } else {
-      let flags;
-      do {
-        flags = this.u16(p); const child = this.u16(p + 2); p += 4;
-        let a, b;
-        if (flags & 1) { a = this.i16(p); b = this.i16(p + 2); p += 4; }
-        else { a = this.b.readInt8(p); b = this.b.readInt8(p + 1); p += 2; }
-        if (!(flags & 2)) throw new Error('Unsupported point-matched composite');
-        let xx = 1, yy = 1, xy = 0, yx = 0;
-        const f2 = () => { const v = this.i16(p) / 16384; p += 2; return v; };
-        if (flags & 8) xx = yy = f2();
-        else if (flags & 64) { xx = f2(); yy = f2(); }
-        else if (flags & 128) { xx = f2(); xy = f2(); yx = f2(); yy = f2(); }
-        for (const c of this.contours(child, depth + 1)) {
-          contours.push(c.map(v => ({ x: xx * v.x + xy * v.y + a, y: yx * v.x + yy * v.y + b, on: v.on })));
+
+  // cmap: a Unicode BMP subtable — platform 3 encoding 1, else platform 0.
+  const cmapOff = tables.get('cmap')!.off;
+  const subs = u16(buf, cmapOff + 2);
+  let best = -1;
+  for (let i = 0; i < subs; i++) {
+    const rec = cmapOff + 4 + i * 8;
+    const plat = u16(buf, rec);
+    const enc = u16(buf, rec + 2);
+    const off = cmapOff + u32(buf, rec + 4);
+    if (u16(buf, off) !== 4) continue;
+    if (plat === 3 && enc === 1) best = off;
+    else if (plat === 0 && best === -1) best = off;
+  }
+  const cmap = new Map<number, number>();
+  if (best >= 0) {
+    const segX2 = u16(buf, best + 6);
+    const ends = best + 14;
+    const starts = ends + segX2 + 2;
+    const deltas = starts + segX2;
+    const ranges = deltas + segX2;
+    for (let s = 0; s < segX2; s += 2) {
+      const end = u16(buf, ends + s);
+      const start = u16(buf, starts + s);
+      const delta = i16(buf, deltas + s);
+      const rangeOffPos = ranges + s;
+      const rangeOff = u16(buf, rangeOffPos);
+      for (let ch = start; ch <= end && ch < 0xffff; ch++) {
+        let gid = 0;
+        if (rangeOff === 0) {
+          gid = (ch + delta) & 0xffff;
+        } else {
+          gid = u16(buf, rangeOffPos + rangeOff + (ch - start) * 2);
+          if (gid !== 0) gid = (gid + delta) & 0xffff;
         }
-      } while (flags & 32);
-    }
-    this.cache.set(id, contours);
-    return contours;
-  }
-}
-const bold = new Face('DejaVuSans-Bold.ttf');
-const regular = new Face('DejaVuSans.ttf');
-const textRecords = [];
-function measure(text, size, face = bold) {
-  let width = 0;
-  for (const c of text) {
-    const id = face.glyphId(c.codePointAt(0));
-    if (!id) throw new Error('Font lacks glyph: ' + c);
-    width += face.advance(id) * size / face.units;
-  }
-  return width;
-}
-function text(str, x, baseline, size, color = WHITE, face = bold, maxWidth = SIZE - x - 48) {
-  const width = measure(str, size, face);
-  if (width > maxWidth + .01) throw new Error('Text overflow: ' + str + ' (' + width + ' > ' + maxWidth + ')');
-  const scale = size * SS / face.units, edges = [];
-  let pen = x * SS, minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  function edge(a, b) {
-    const x0 = pen + a.x * scale, y0 = baseline * SS - a.y * scale;
-    const x1 = pen + b.x * scale, y1 = baseline * SS - b.y * scale;
-    minX = Math.min(minX, x0, x1); maxX = Math.max(maxX, x0, x1);
-    minY = Math.min(minY, y0, y1); maxY = Math.max(maxY, y0, y1);
-    if (y0 !== y1) edges.push([x0, y0, x1, y1]);
-  }
-  for (const char of str) {
-    const id = face.glyphId(char.codePointAt(0));
-    for (const contour of face.contours(id)) {
-      if (!contour.length) continue;
-      const expanded = [];
-      for (let i = 0; i < contour.length; i++) {
-        const a = contour[i], b = contour[(i + 1) % contour.length];
-        expanded.push(a);
-        if (!a.on && !b.on) expanded.push({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, on: true });
-      }
-      const first = expanded.findIndex(p => p.on);
-      const pts = expanded.slice(first).concat(expanded.slice(0, first));
-      pts.push(pts[0]);
-      let current = pts[0];
-      for (let i = 1; i < pts.length; i++) {
-        const next = pts[i];
-        if (next.on) { edge(current, next); current = next; }
-        else {
-          const end = pts[++i], start = current;
-          const steps = Math.max(6, Math.ceil((Math.hypot(next.x - start.x, next.y - start.y) + Math.hypot(end.x - next.x, end.y - next.y)) * scale / 3));
-          for (let j = 1; j <= steps; j++) {
-            const t = j / steps, u = 1 - t;
-            const point = { x: u * u * start.x + 2 * u * t * next.x + t * t * end.x, y: u * u * start.y + 2 * u * t * next.y + t * t * end.y };
-            edge(current, point); current = point;
-          }
-        }
+        if (gid) cmap.set(ch, gid);
       }
     }
-    pen += face.advance(id) * scale;
   }
-  if (minX < 0 || maxX >= W || minY < 0 || maxY >= W) throw new Error('Clipped text: ' + str);
-  // Some TrueType capitals have a fractional negative left side-bearing.
-  // Reserve two pixels within the tile padding for that legitimate ink.
-  if (minX < (x - 2) * SS || maxX > (x + maxWidth) * SS + .01) throw new Error('Ink exceeds text box: ' + str);
-  for (let y = Math.floor(minY); y <= Math.ceil(maxY); y++) {
-    const scan = y + .5, hits = [];
-    for (const [x0, y0, x1, y1] of edges) {
-      if (scan >= Math.min(y0, y1) && scan < Math.max(y0, y1)) hits.push([x0 + (scan - y0) * (x1 - x0) / (y1 - y0), y1 > y0 ? 1 : -1]);
-    }
-    hits.sort((a, b) => a[0] - b[0]);
-    let winding = 0, start = 0;
-    for (const [x, direction] of hits) {
-      if (winding === 0) start = x;
-      winding += direction;
-      if (winding === 0) span(y, start, x, color);
-    }
-  }
-  textRecords.push({ text: str, size, x, baseline, width: +width.toFixed(2), bounds: [minX, minY, maxX, maxY].map(v => +(v / SS).toFixed(2)) });
+
+  return { upem, numGlyphs, loca, glyf: tables.get('glyf')!.off, cmap, adv, buf };
 }
 
-// Six bespoke line illustrations, not fonts or external image assets.
-function icon(kind, x, y) {
-  const p = points => path(points.map(([a, b]) => [x + a, y + b]));
-  const l = (a, b, c, d) => line(x + a, y + b, x + c, y + d);
-  const c = (a, b, r) => circle(x + a, y + b, r);
-  if (kind === 'war') {
-    p([[2, 49], [2, 34], [16, 34], [16, 49], [23, 49], [23, 25], [38, 25], [38, 49], [49, 49]]);
-    p([[32, 3], [50, 15], [43, 22], [25, 10], [32, 3]]);
-    l(22, 14, 12, 22); l(27, 20, 18, 28);
-    l(52, 29, 52, 39); l(47, 34, 57, 34);
-  } else if (kind === 'markets') {
-    l(2, 5, 2, 50); l(2, 50, 59, 50);
-    p([[8, 12], [21, 22], [32, 16], [46, 37], [58, 43]]);
-    p([[48, 43], [58, 43], [58, 33]]);
-    l(12, 33, 12, 43); l(25, 31, 25, 43); l(38, 39, 38, 43);
-  } else if (kind === 'shipping') {
-    p([[2, 31], [59, 31], [49, 45], [13, 45], [2, 31]]);
-    p([[13, 31], [13, 18], [44, 18], [44, 31]]);
-    l(21, 18, 21, 31); l(31, 18, 31, 31);
-    p([[44, 18], [44, 10], [53, 10], [53, 31]]);
-    p([[1, 52], [11, 55], [21, 52], [31, 55], [41, 52], [51, 55], [61, 52]]);
-    l(30, 2, 30, 9); l(23, 5, 18, 10); l(37, 5, 42, 10);
-  } else if (kind === 'diplomacy') {
-    p([[5, 52], [5, 6], [32, 6], [32, 25], [5, 25]]);
-    l(15, 6, 15, 25); l(5, 15, 32, 15);
-    p([[39, 4], [57, 4], [57, 53], [39, 53]]);
-    l(24, 38, 49, 38); p([[43, 32], [49, 38], [43, 44]]);
-  } else if (kind === 'fire') {
-    p([[3, 52], [3, 29], [19, 36], [19, 29], [34, 36], [34, 52], [3, 52]]);
-    p([[8, 28], [8, 15], [16, 15], [16, 32]]);
-    p([[44, 48], [39, 39], [42, 29], [47, 20], [46, 7], [56, 21], [60, 33], [58, 43], [51, 49], [44, 48]]);
-    p([[47, 43], [47, 35], [51, 28], [54, 37], [51, 44]]);
-  } else {
-    // Pill plus orbital path: the two science stories in one small drawing.
-    p([[6, 38], [27, 17]]); p([[16, 48], [37, 27]]);
-    const arc = (cx, cy, a0) => {
-      const points = [];
-      for (let i = 0; i <= 20; i++) { const a = a0 + i / 20 * Math.PI; points.push([cx + 7 * Math.cos(a), cy + 7 * Math.sin(a)]); }
-      p(points);
-    };
-    arc(11, 43, Math.PI / 4); arc(32, 22, -3 * Math.PI / 4);
-    l(16, 28, 26, 38); c(46, 12, 9);
-    p([[35, 4], [39, 0], [50, 0], [58, 5], [60, 13], [56, 22]]);
+type Pt = { x: number; y: number; on: boolean };
+
+/** The glyph's contours as point rings in font units, y up. */
+function glyphContours(face: Face, gid: number): Pt[][] {
+  const b = face.buf;
+  const start = face.glyf + face.loca[gid];
+  const end = face.glyf + face.loca[gid + 1];
+  if (end <= start) return [];
+  const nContours = i16(b, start);
+  if (nContours < 0) return []; // composite glyph: none of the poster's characters need one
+  const endPts: number[] = [];
+  for (let i = 0; i < nContours; i++) endPts.push(u16(b, start + 10 + i * 2));
+  const nPts = endPts.length ? endPts[endPts.length - 1] + 1 : 0;
+  let p = start + 10 + nContours * 2;
+  p += 2 + u16(b, p); // skip the hinting instructions
+  const flags: number[] = [];
+  while (flags.length < nPts) {
+    const f = b[p++];
+    flags.push(f);
+    if (f & 8) {
+      const rep = b[p++];
+      for (let r = 0; r < rep; r++) flags.push(f);
+    }
+  }
+  const xs: number[] = [];
+  let x = 0;
+  for (let i = 0; i < nPts; i++) {
+    const f = flags[i];
+    if (f & 2) {
+      const d = b[p++];
+      x += f & 16 ? d : -d;
+    } else if (!(f & 16)) {
+      x += i16(b, p);
+      p += 2;
+    }
+    xs.push(x);
+  }
+  const ys: number[] = [];
+  let y = 0;
+  for (let i = 0; i < nPts; i++) {
+    const f = flags[i];
+    if (f & 4) {
+      const d = b[p++];
+      y += f & 32 ? d : -d;
+    } else if (!(f & 32)) {
+      y += i16(b, p);
+      p += 2;
+    }
+    ys.push(y);
+  }
+  const contours: Pt[][] = [];
+  let first = 0;
+  for (const lastPt of endPts) {
+    const pts: Pt[] = [];
+    for (let i = first; i <= lastPt; i++) pts.push({ x: xs[i], y: ys[i], on: (flags[i] & 1) === 1 });
+    contours.push(pts);
+    first = lastPt + 1;
+  }
+  return contours;
+}
+
+/** Flatten quadratic contours into closed polygons (font units, y up). */
+function flatten(contours: Pt[][], steps = 6): number[][] {
+  const out: number[][] = [];
+  for (const ringIn of contours) {
+    if (ringIn.length === 0) continue;
+    const pts = ringIn.slice();
+    let shift = pts.findIndex((q) => q.on);
+    if (shift < 0) {
+      pts.push({ x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2, on: true });
+      shift = pts.length - 1;
+    }
+    const ring = [...pts.slice(shift), ...pts.slice(0, shift)];
+    const poly: number[] = [ring[0].x, ring[0].y];
+    for (let i = 1; i <= ring.length; i++) {
+      const q = ring[i % ring.length];
+      const prev = ring[(i - 1) % ring.length];
+      if (q.on) {
+        poly.push(q.x, q.y);
+        continue;
+      }
+      const next = ring[(i + 1) % ring.length];
+      const endPt = next.on ? next : { x: (q.x + next.x) / 2, y: (q.y + next.y) / 2, on: true };
+      for (let s = 1; s <= steps; s++) {
+        const t = s / steps;
+        const mt = 1 - t;
+        poly.push(
+          mt * mt * prev.x + 2 * mt * t * q.x + t * t * endPt.x,
+          mt * mt * prev.y + 2 * mt * t * q.y + t * t * endPt.y,
+        );
+      }
+    }
+    out.push(poly);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- canvas
+
+type Canvas = { data: Uint8ClampedArray; w: number; h: number };
+
+function makeCanvas(w: number, h: number): Canvas {
+  const data = new Uint8ClampedArray(w * h * 3);
+  for (let i = 0; i < w * h; i++) {
+    data[i * 3] = INK[0];
+    data[i * 3 + 1] = INK[1];
+    data[i * 3 + 2] = INK[2];
+  }
+  return { data, w, h };
+}
+
+function fillPoly(c: Canvas, poly: number[], color: RGB): void {
+  if (poly.length < 6) return;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (let i = 1; i < poly.length; i += 2) {
+    if (poly[i] < minY) minY = poly[i];
+    if (poly[i] > maxY) maxY = poly[i];
+  }
+  const y0 = Math.max(0, Math.floor(minY));
+  const y1 = Math.min(c.h - 1, Math.ceil(maxY));
+  const xs: number[] = [];
+  for (let y = y0; y <= y1; y++) {
+    const sy = y + 0.5;
+    xs.length = 0;
+    for (let i = 0; i < poly.length; i += 2) {
+      const ax = poly[i];
+      const ay = poly[i + 1];
+      const j = (i + 2) % poly.length;
+      const bx = poly[j];
+      const by = poly[j + 1];
+      if (ay === by) continue;
+      if ((sy >= ay && sy < by) || (sy >= by && sy < ay)) {
+        xs.push(ax + ((sy - ay) / (by - ay)) * (bx - ax));
+      }
+    }
+    if (xs.length < 2) continue;
+    xs.sort((a, b) => a - b);
+    for (let k = 0; k + 1 < xs.length; k += 2) {
+      const xa = Math.max(0, Math.ceil(xs[k]));
+      const xb = Math.min(c.w - 1, Math.floor(xs[k + 1]));
+      for (let x = xa; x <= xb; x++) {
+        const o = (y * c.w + x) * 3;
+        c.data[o] = color[0];
+        c.data[o + 1] = color[1];
+        c.data[o + 2] = color[2];
+      }
+    }
   }
 }
 
-text('THE WORLD / DAILY BRIEF', 48, 49, 17, MUTED);
-text('SATURDAY 21', 43, 125, 72);
-text('NOVEMBER 2026', 43, 205, 72, ACCENT);
-// A quiet globe balances the date without competing with its type hierarchy.
-circle(865, 138, 63, ACCENT, 1.5);
-line(802, 138, 928, 138, ACCENT, 1.2);
-for (const latitude of [-27, 27]) {
-  const half = Math.sqrt(63 * 63 - latitude * latitude);
-  line(865 - half, 138 + latitude, 865 + half, 138 + latitude, ACCENT, 1.2);
+function rect(c: Canvas, x: number, y: number, w: number, h: number, color: RGB): void {
+  fillPoly(c, [x, y, x + w, y, x + w, y + h, x, y + h], color);
 }
-for (const sign of [-1, 1]) {
-  const points = [];
+
+function frame(c: Canvas, x: number, y: number, w: number, h: number, t: number, color: RGB): void {
+  rect(c, x, y, w, t, color);
+  rect(c, x, y + h - t, w, t, color);
+  rect(c, x, y, t, h, color);
+  rect(c, x + w - t, y, t, h, color);
+}
+
+function stroke(c: Canvas, pts: [number, number][], t: number, color: RGB): void {
+  for (let i = 0; i + 1 < pts.length; i++) {
+    const [ax, ay] = pts[i];
+    const [bx, by] = pts[i + 1];
+    const len = Math.hypot(bx - ax, by - ay) || 1;
+    const nx = (-(by - ay) / len) * (t / 2);
+    const ny = ((bx - ax) / len) * (t / 2);
+    fillPoly(c, [ax + nx, ay + ny, bx + nx, by + ny, bx - nx, by - ny, ax - nx, ay - ny], color);
+  }
+}
+
+function circle(c: Canvas, cx: number, cy: number, r: number, t: number, color: RGB): void {
+  const ring: [number, number][] = [];
   for (let i = 0; i <= 48; i++) {
-    const a = -Math.PI / 2 + i * Math.PI / 48;
-    points.push([865 + sign * 28 * Math.cos(a), 138 + 63 * Math.sin(a)]);
+    const a = (i / 48) * Math.PI * 2;
+    ring.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]);
   }
-  path(points, ACCENT, 1.2);
+  stroke(c, ring, t, color);
 }
-rect(48, 231, 928, 3, ACCENT);
-text('SIX STORIES. ONE DAY.', 48, 258, 16, MUTED);
-text('21 / 11 / 26', 860, 258, 16, MUTED, regular, 116);
 
-const stories = [
-  { label: 'EUROPE / WAR', title: ['Russia hits', 'Ukraine, Poland'], detail: '400+ drones; 110 missiles; Kyiv: 8+ killed', extra: 'Power cut in 10 regions', note: 'NATO calls Poland hit a grave violation', icon: 'war' },
-  { label: 'NORTH AMERICA / MARKETS', title: ['AI sell-off hits', 'world stocks'], detail: 'S&P 500 in correction; Nikkei falls 5.1%', extra: 'An AI-led global retreat', note: 'US technology losses ripple across markets', icon: 'markets' },
-  { label: 'MIDDLE EAST / SHIPPING', title: ['Tankers struck', 'near Hormuz'], detail: 'Two tanker incidents near Khasab, Oman', extra: 'US-Iran talks stalled', note: 'Trump warns Iran over reported dirty-bomb plot', icon: 'shipping' },
-  { label: 'EUROPE / DIPLOMACY', title: ['Denmark expels', 'Russian attache'], detail: 'Defence attache ordered out in seven days', extra: 'Copenhagen tightens entry', note: 'Non-essential visas for Russians halted', icon: 'diplomacy' },
-  { label: 'IRAQ / DISASTER', title: ['Basra plant fire', 'kills four'], detail: 'Power plant blaze leaves at least 30 hurt', extra: 'At least four people dead', note: 'A deadly day for the southern Iraqi city', icon: 'fire' },
-  { label: 'SCIENCE / HEALTH', title: ['Trial pill', 'shrinks tumours'], detail: 'Pancreatic tumours vanish in some patients', extra: 'A small early trial', note: 'Reported on 21 November 2026', icon: 'science' },
+// ---------------------------------------------------------------- type
+
+const FONT_DIR = join(HERE, 'assets');
+
+type Font = { face: Face; cache: Map<number, number[][]> };
+
+function openFont(name: string): Font {
+  const candidates = [join(FONT_DIR, name), join('/usr/share/fonts/truetype/dejavu', name)];
+  for (const p of candidates) {
+    try {
+      return { face: loadFace(p), cache: new Map() };
+    } catch {
+      continue;
+    }
+  }
+  throw new Error(`no face ${name}`);
+}
+
+const bold = openFont('DejaVuSans-Bold.ttf');
+const regular = openFont('DejaVuSans.ttf');
+
+function polys(font: Font, ch: string): number[][] {
+  const gid = font.face.cmap.get(ch.codePointAt(0) ?? 63) ?? 0;
+  let got = font.cache.get(gid);
+  if (!got) {
+    got = flatten(glyphContours(font.face, gid));
+    font.cache.set(gid, got);
+  }
+  return got;
+}
+
+function textWidth(font: Font, s: string, size: number): number {
+  let w = 0;
+  for (const ch of s) {
+    const gid = font.face.cmap.get(ch.codePointAt(0) ?? 63) ?? 0;
+    w += font.face.adv[gid] ?? 0;
+  }
+  return (w * size) / font.face.upem;
+}
+
+/** Draw `s` with its left edge at x and its baseline at y, in device pixels. */
+function text(c: Canvas, font: Font, s: string, x: number, y: number, size: number, color: RGB): number {
+  const scale = (size * SS) / font.face.upem;
+  let pen = x * SS;
+  const base = y * SS;
+  for (const ch of s) {
+    const gid = font.face.cmap.get(ch.codePointAt(0) ?? 63) ?? 0;
+    for (const poly of polys(font, ch)) {
+      const shifted: number[] = new Array(poly.length);
+      for (let i = 0; i < poly.length; i += 2) {
+        shifted[i] = pen + poly[i] * scale;
+        shifted[i + 1] = base - poly[i + 1] * scale;
+      }
+      fillPoly(c, shifted, color);
+    }
+    pen += (font.face.adv[gid] ?? 0) * scale;
+  }
+  return pen / SS;
+}
+
+/** Break `s` into lines no wider than `max`, never splitting a word. */
+function wrap(font: Font, s: string, size: number, max: number): string[] {
+  const lines: string[] = [];
+  let cur = '';
+  for (const word of s.split(' ')) {
+    const trial = cur ? `${cur} ${word}` : word;
+    if (textWidth(font, trial, size) <= max || !cur) cur = trial;
+    else {
+      lines.push(cur);
+      cur = word;
+    }
+  }
+  if (cur) lines.push(cur);
+  return lines;
+}
+
+// ---------------------------------------------------------------- the poster
+
+const c = makeCanvas(W * SS, H * SS);
+const M = 44; // page margin
+const S = (v: number) => v * SS;
+
+function box(x: number, y: number, w: number, h: number): void {
+  frame(c, S(x), S(y), S(w), S(h), S(1), RULE);
+}
+
+text(c, bold, 'THE WORLD / DAILY BRIEF', M, 58, 15, MUTED);
+text(c, bold, 'SATURDAY 21', M - 3, 138, 74, PAPER);
+const monthEnd = text(c, bold, 'NOVEMBER', M - 3, 212, 74, ACCENT);
+text(c, bold, '2026', monthEnd + 12, 212, 74, ACCENT);
+rect(c, S(M), S(234), S(W - 2 * M), S(2), ACCENT);
+text(c, regular, 'SIX STORIES. ONE DAY.', M, 266, 15, PAPER);
+text(c, regular, '21 / 11 / 26', W - M - textWidth(regular, '21 / 11 / 26', 15), 266, 15, MUTED);
+
+// a wireframe globe, top right
+const gx = W - M - 36;
+const gy = 92;
+circle(c, S(gx), S(gy), S(32), S(2), ACCENT);
+stroke(c, [[S(gx - 32), S(gy)], [S(gx + 32), S(gy)]], S(2), ACCENT);
+const meridian: [number, number][] = [];
+for (let i = 0; i <= 48; i++) {
+  const a = (i / 48) * Math.PI * 2;
+  meridian.push([S(gx + Math.cos(a) * 15), S(gy + Math.sin(a) * 32)]);
+}
+stroke(c, meridian, S(1.4), ACCENT);
+
+type Story = {
+  region: string;
+  head: string[];
+  kicker: string;
+  detail: string;
+  icon: (x: number, y: number) => void;
+};
+
+const stories: Story[] = [
+  {
+    region: 'EUROPE / WAR',
+    head: ['Russia hits', 'Ukraine, Poland'],
+    kicker: '400+ drones, 110 missiles',
+    detail: 'Eight killed in Kyiv, power cut in ten regions, projectiles landing in Poland',
+    icon: (x, y) => {
+      stroke(c, [[S(x), S(y + 30)], [S(x + 13), S(y + 6)], [S(x + 25), S(y + 30)], [S(x + 34), S(y + 16)]], S(2.4), ACCENT);
+      stroke(c, [[S(x + 6), S(y + 38)], [S(x + 30), S(y + 38)]], S(2.4), ACCENT);
+    },
+  },
+  {
+    region: 'NORTH AMERICA / MARKETS',
+    head: ['AI sell-off hits', 'world stocks'],
+    kicker: 'S&P 500 in correction',
+    detail: "Japan's Nikkei falls 5.1% as AI-led selling spreads across markets",
+    icon: (x, y) => {
+      stroke(c, [[S(x), S(y + 6)], [S(x + 11), S(y + 20)], [S(x + 21), S(y + 10)], [S(x + 34), S(y + 34)]], S(2.4), ACCENT);
+      stroke(c, [[S(x + 25), S(y + 34)], [S(x + 34), S(y + 34)], [S(x + 34), S(y + 25)]], S(2.4), ACCENT);
+    },
+  },
+  {
+    region: 'MIDDLE EAST / SHIPPING',
+    head: ['Tankers struck', 'near Hormuz'],
+    kicker: 'Two incidents off Khasab',
+    detail: 'US-Iran talks stalled as Trump warns Tehran over a reported bomb plot',
+    icon: (x, y) => {
+      stroke(c, [[S(x), S(y + 30)], [S(x + 38), S(y + 30)], [S(x + 32), S(y + 38)], [S(x + 6), S(y + 38)], [S(x), S(y + 30)]], S(2.2), ACCENT);
+      stroke(c, [[S(x + 16), S(y + 30)], [S(x + 16), S(y + 8)], [S(x + 28), S(y + 30)]], S(2.2), ACCENT);
+    },
+  },
+  {
+    region: 'EUROPE / DIPLOMACY',
+    head: ['Denmark expels', 'Russian attache'],
+    kicker: 'Seven days to leave',
+    detail: 'Copenhagen halts non-essential visas for Russians after the expulsion',
+    icon: (x, y) => {
+      stroke(c, [[S(x + 4), S(y + 38)], [S(x + 4), S(y + 6)], [S(x + 34), S(y + 6)], [S(x + 34), S(y + 38)]], S(2.2), ACCENT);
+      stroke(c, [[S(x + 13), S(y + 18)], [S(x + 25), S(y + 30)]], S(2.2), ACCENT);
+      stroke(c, [[S(x + 25), S(y + 18)], [S(x + 13), S(y + 30)]], S(2.2), ACCENT);
+    },
+  },
+  {
+    region: 'IRAQ / DISASTER',
+    head: ['Basra plant fire', 'kills four'],
+    kicker: 'Thirty more injured',
+    detail: 'A blaze at a power plant in the southern city, its cause still unclear',
+    icon: (x, y) => {
+      stroke(c, [[S(x + 18), S(y + 4)], [S(x + 30), S(y + 18)], [S(x + 18), S(y + 38)], [S(x + 6), S(y + 18)], [S(x + 18), S(y + 4)]], S(2.2), ACCENT);
+      stroke(c, [[S(x + 18), S(y + 18)], [S(x + 18), S(y + 30)]], S(2.2), ACCENT);
+    },
+  },
+  {
+    region: 'SCIENCE / HEALTH',
+    head: ['Trial pill', 'shrinks tumours'],
+    kicker: 'Pancreatic cancer study',
+    detail: 'Tumours vanished in some patients; BepiColombo reached Mercury orbit',
+    icon: (x, y) => {
+      circle(c, S(x + 17), S(y + 21), S(15), S(2.2), ACCENT);
+      stroke(c, [[S(x + 2), S(y + 21)], [S(x + 32), S(y + 21)]], S(2.2), ACCENT);
+    },
+  },
 ];
-for (let i = 0; i < stories.length; i++) {
-  const s = stories[i], x = 48 + i % 2 * 472, y = 278 + Math.floor(i / 2) * 238;
-  rect(x, y, 456, 1, BORDER); rect(x, y + 221, 456, 1, BORDER);
-  rect(x, y, 1, 222, BORDER); rect(x + 455, y, 1, 222, BORDER);
-  rect(x, y, 3, 36, ACCENT);
-  text(s.label, x + 20, y + 29, 15, ACCENT, bold, 337);
-  icon(s.icon, x + 369, y + 17);
-  text(s.title[0], x + 20, y + 93, 32, WHITE, bold, 416);
-  text(s.title[1], x + 20, y + 131, 32, WHITE, bold, 416);
-  text(s.detail, x + 20, y + 157, 14, MUTED, regular, 416);
-  text(s.extra, x + 20, y + 186, 19, ACCENT, bold, 416);
-  text(s.note, x + 20, y + 208, 14, MUTED, regular, 416);
-}
-text('WORLD NEWS', 48, 1001, 13, MUTED);
-text('SATURDAY EDITION', 826, 1001, 13, MUTED, bold, 150);
 
-// PNG encoding: RGB, no ancillary metadata, fixed deflate settings, valid CRCs.
-function crc32(buf) {
-  let c = 0xffffffff;
-  for (const value of buf) {
-    c ^= value;
-    for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (c & 1 ? 0xedb88320 : 0);
+const tileW = 464;
+const tileH = 224;
+const top = 276;
+stories.forEach((st, i) => {
+  const x = M + (i % 2) * (tileW + 24);
+  const y = top + Math.floor(i / 2) * (tileH + 18);
+  box(x, y, tileW, tileH);
+  text(c, bold, st.region, x + 18, y + 28, 14, ACCENT);
+  st.icon(x + tileW - 58, y + 48);
+  let base = y + 78;
+  for (const line of st.head) {
+    text(c, bold, line, x + 18, base, 32, PAPER);
+    base += 37;
   }
-  return (c ^ 0xffffffff) >>> 0;
-}
-function chunk(type, data) {
-  const body = Buffer.concat([Buffer.from(type), data]), result = Buffer.alloc(data.length + 12);
-  result.writeUInt32BE(data.length, 0); body.copy(result, 4);
-  result.writeUInt32BE(crc32(body), result.length - 4); return result;
-}
-const raw = Buffer.alloc(SIZE * (1 + SIZE * 3));
-for (let y = 0; y < SIZE; y++) {
-  const row = y * (1 + SIZE * 3); raw[row] = 0;
-  for (let x = 0; x < SIZE; x++) {
-    for (let c = 0; c < 3; c++) {
+  text(c, regular, st.kicker, x + 18, base + 4, 16, ACCENT);
+  let dy = base + 26;
+  for (const line of wrap(regular, st.detail, 15, tileW - 40)) {
+    text(c, regular, line, x + 18, dy, 15, MUTED);
+    dy += 20;
+  }
+});
+
+text(c, regular, 'WORLD NEWS', M, H - 18, 13, MUTED);
+const edition = 'SATURDAY EDITION';
+text(c, regular, edition, W - M - textWidth(regular, edition, 13), H - 18, 13, MUTED);
+
+// ---------------------------------------------------------------- downscale + PNG
+
+const flat = Buffer.alloc(W * H * 3);
+for (let y = 0; y < H; y++) {
+  for (let x = 0; x < W; x++) {
+    for (let ch = 0; ch < 3; ch++) {
       let sum = 0;
-      for (let sy = 0; sy < SS; sy++) for (let sx = 0; sx < SS; sx++) sum += pixels[((y * SS + sy) * W + x * SS + sx) * 3 + c];
-      raw[row + 1 + x * 3 + c] = Math.round(sum / (SS * SS));
+      for (let dy = 0; dy < SS; dy++) {
+        for (let dx = 0; dx < SS; dx++) {
+          sum += c.data[((y * SS + dy) * c.w + (x * SS + dx)) * 3 + ch];
+        }
+      }
+      flat[(y * W + x) * 3 + ch] = Math.round(sum / (SS * SS));
     }
   }
 }
+
+const raw = Buffer.alloc((W * 3 + 1) * H);
+for (let y = 0; y < H; y++) {
+  raw[y * (W * 3 + 1)] = 0;
+  flat.copy(raw, y * (W * 3 + 1) + 1, y * W * 3, (y + 1) * W * 3);
+}
+
+const crcTable = (() => {
+  const t = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let v = n;
+    for (let k = 0; k < 8; k++) v = v & 1 ? 0xedb88320 ^ (v >>> 1) : v >>> 1;
+    t[n] = v;
+  }
+  return t;
+})();
+function crc32(buf: Buffer): number {
+  let v = -1;
+  for (let i = 0; i < buf.length; i++) v = crcTable[(v ^ buf[i]) & 0xff] ^ (v >>> 8);
+  return (v ^ -1) >>> 0;
+}
+function chunk(kind: string, body: Buffer): Buffer {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(body.length);
+  const type = Buffer.from(kind, 'ascii');
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(Buffer.concat([type, body])));
+  return Buffer.concat([len, type, body, crc]);
+}
+
 const ihdr = Buffer.alloc(13);
-ihdr.writeUInt32BE(SIZE, 0); ihdr.writeUInt32BE(SIZE, 4); ihdr[8] = 8; ihdr[9] = 2;
-const png = Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', deflateSync(raw, { level: 9 })), chunk('IEND', Buffer.alloc(0))]);
-if (png.length > 1048576) throw new Error('PNG exceeds contest size cap');
-const output = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-mkdirSync(output, { recursive: true });
-writeFileSync(join(output, 'entry.png'), png);
-console.log(JSON.stringify({ image: 'entry.png', width: SIZE, height: SIZE, bytes: png.length, text: textRecords }));
+ihdr.writeUInt32BE(W, 0);
+ihdr.writeUInt32BE(H, 4);
+ihdr[8] = 8;
+ihdr[9] = 2;
+const png = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  chunk('IHDR', ihdr),
+  chunk('IDAT', deflateSync(raw, { level: 9 })),
+  chunk('IEND', Buffer.alloc(0)),
+]);
+
+mkdirSync(OUT_DIR, { recursive: true });
+writeFileSync(join(OUT_DIR, 'entry.png'), png);
+console.log(JSON.stringify({ image: 'entry.png', width: W, height: H, bytes: png.length }));
