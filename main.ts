@@ -314,7 +314,7 @@ const stories = [
   { label: 'MIDDLE EAST / SHIPPING', title: ['Tankers struck', 'near Hormuz'], detail: 'Two tanker incidents near Khasab, Oman', extra: 'US-Iran talks stalled', note: 'Trump warns Iran over reported dirty-bomb plot', icon: 'shipping' },
   { label: 'EUROPE / DIPLOMACY', title: ['Denmark expels', 'Russian attache'], detail: 'Defence attache ordered out in seven days', extra: 'Copenhagen tightens entry', note: 'Non-essential visas for Russians halted', icon: 'diplomacy' },
   { label: 'IRAQ / DISASTER', title: ['Basra plant fire', 'kills four'], detail: 'Power plant blaze leaves at least 30 hurt', extra: 'At least four people dead', note: 'A deadly day for the southern Iraqi city', icon: 'fire' },
-  { label: 'SCIENCE / HEALTH', title: ['Trial pill', 'shrinks tumours'], detail: 'Pancreatic tumours vanish in some patients', extra: 'BepiColombo at Mercury', note: 'The spacecraft reaches orbit around Mercury', icon: 'science' },
+  { label: 'SCIENCE / HEALTH', title: ['Trial pill', 'shrinks tumours'], detail: 'Pancreatic tumours vanish in some patients', extra: 'A small early trial', note: 'Reported on 21 November 2026', icon: 'science' },
 ];
 for (let i = 0; i < stories.length; i++) {
   const s = stories[i], x = 48 + i % 2 * 472, y = 278 + Math.floor(i / 2) * 238;

@@ -25,7 +25,7 @@ The dependency-free verifier runs the generator twice in separate scratch direct
 
 Validation performed during this build:
 
-- 1024 x 1024 RGB PNG, 63,614 bytes; valid checksums and complete payload.
+- 1024 x 1024 RGB PNG, 62,909 bytes; valid checksums and complete payload.
 - Two independent runs: byte-identical; approximately 1.2 seconds each.
 - Checked-in image equals `out/entry.png` and both verifier outputs.
 - Separate Bubblewrap execution: read-only repository and root filesystem, working directory `/`, external writable `/output`, empty system-font directory, hidden reference `entry.png`, cleared environment, dropped capabilities, and disabled networking. Output remained byte-identical.
